@@ -1,4 +1,4 @@
-local BatchQueue = require "kong.tools.batch_queue"
+local Queue = require "kong.tools.queue"
 local constants = require "kong.plugins.statsd.constants"
 local statsd_logger = require "kong.plugins.statsd.statsd_logger"
 local ws = require "kong.workspaces"
@@ -15,8 +15,6 @@ local ipairs = ipairs
 local tonumber = tonumber
 local knode = kong and kong.node or require "kong.pdk.node".new()
 local null = ngx.null
-
-local queues = {}
 
 local START_RANGE_IDX = 1
 local END_RANGE_IDX   = 2
@@ -45,7 +43,7 @@ local function extract_range(status_code_list, range)
     local range_result, err = match(range, constants.REGEX_SPLIT_STATUS_CODES_BY_DASH, "oj")
 
     if err then
-      kong.log.error(err)
+      kong.log.err(err)
       return
     end
     ranges[range] = { range_result[START_RANGE_IDX], range_result[END_RANGE_IDX] }
@@ -134,8 +132,7 @@ local get_workspace_id = {
     return ws.get_workspace_id()
   end,
   workspace_name = function()
-    local workspace = ws.get_workspace()
-    return workspace.name
+    return ws.get_workspace_name()
   end
 }
 
@@ -369,7 +366,7 @@ local function get_tags(conf, message, metric_config)
 end
 
 
-local function log(conf, messages)
+local function send_entries_to_upstream_server(conf, messages)
   local logger, err = statsd_logger:new(conf)
   if err then
     kong.log.err("failed to create Statsd logger: ", err)
@@ -444,7 +441,7 @@ function _M.execute(conf)
   kong.log.debug("Status code is within given status code ranges")
 
   if not worker_id then
-    worker_id = ngx.worker.id()
+    worker_id = ngx.worker.id() or -1
   end
 
   conf._prefix = conf.prefix
@@ -456,31 +453,15 @@ function _M.execute(conf)
   local message = kong.log.serialize({ngx = ngx, kong = kong, })
   message.cache_metrics = ngx.ctx.cache_metrics
 
-  local queue_id = kong.plugin.get_id()
-  local q = queues[queue_id]
-  if not q then
-    local batch_max_size = conf.queue_size or 1
-    local process = function (entries)
-      return log(conf, entries)
-    end
-
-    local opts = {
-      retry_count    = conf.retry_count or 10,
-      flush_timeout  = conf.flush_timeout or 2,
-      batch_max_size = batch_max_size,
-      process_delay  = 0,
-    }
-
-    local err
-    q, err = BatchQueue.new("statsd", process, opts)
-    if not q then
-      kong.log.err("could not create queue: ", err)
-      return
-    end
-    queues[queue_id] = q
+  local ok, err = Queue.enqueue(
+    Queue.get_plugin_params("statsd", conf),
+    send_entries_to_upstream_server,
+    conf,
+    message
+  )
+  if not ok then
+    kong.log.err("Failed to enqueue log entry to StatsD server: ", err)
   end
-
-  q:add(message)
 end
 
 -- only for test
